@@ -1,0 +1,250 @@
+---
+title: "Revenue Forecasting"
+author: "George C. Sturrock"
+date: "December 1, 2019"
+output:
+  html_notebook: default
+  html_document: default
+---
+
+## Introduction
+Accurate revenue forecasting is a critical component in the strategic plan of many corporations.  Updating and creating meaningful revenue forecasts is a labor intensive, manual effort at many companies.  Profit center leaders are asked to make revenue projections for their centers based on their own expertise or methodology.  These forecasts are returned to a central planning group where they are reviewed, input, and summarized to make a projection for the company.  This process consumes a large swatch of human capital on a periodic basis.  Additionally, methods such as copying past year's numbers or applying a flat period over period growth rate are typically used to produce these numbers.  This study investigates statistical, time-series based methods to make revenue projections.  In addition to automating the forecasting process, time-series based forecasts may provide superior insights to the methods described above.  Several time-series methods are investigated to determine the best model for forecasting revenue over a 12 month horizon.  
+
+## Data Exploration and Engineering
+The dataset for this study is sample revenue and opportunity data.  The data begins in October 2013 and ends in September 2019.  Both the revenue and opportunities are listed per month.  THe revenue data is in US Dollars and is based on revenue earned in the month in which work was performed (accrual-based accounting).  Opportunities represent the count of prospective customers or projects created by the sales department during the month.  There is an expectation of a lag between opportunities and revenue as opportunities have to travel through the sales pipeline before they are converted to won projects.  Even after a project is won, legal proceedings must conclude prior to starting and billing for work.  
+
+The following R libraries are used to support data exploration and the various time series methods used 
+```{r load libraries, message=FALSE}
+library(tswge)
+library(nnfor)
+library(vars)
+library(readr)
+library(dplyr)
+library(forecast)
+```
+
+The monthly revenue and opportunities, or leads, are read from CSV format into R.  
+```{r Read Data, message=FALSE}
+IEGRevenueMonthly <- read_csv("~/SMU Data Science/TimeSeries/Project/IEGRevenueMonthly.csv", 
+                              col_types = cols(Invoice_Amount = col_number()))
+
+IEGLeadsMonthly <- read_csv("~/SMU Data Science/TimeSeries/Project/IEGLeadsMonthly.csv")
+```
+
+The revenue and leads are then merged into a single R dataframe.  The lead data is subset to match the timeframe of the revenue data (October 2013 - September 2019).  
+```{r}
+IEGLeads <- IEGLeadsMonthly[3:77,]
+IEG <- merge(IEGRevenueMonthly, IEGLeads, by = c("Year", "Month_Nbr"))
+head(IEG)
+```
+
+There is a clear positive correlation between the number of monthly leads and invoiced amounts.  This is to be expected as leads directly contribute to billable work which leads to revenue.
+```{r}
+plot(IEG[,3:4], main="Relationship Between Variables")
+```
+
+Further investigation of the relationship between invoice amount and leads show the two variables have shared a general upward trajectory over the life of the dataset.  A visible lag affect between leads and invoice amount is hard to detect through visual inspection.  There appears to be a eight month trend where leads are declining at the end of the dataset.  This could result in a similar impact on invoice amount.  
+```{r}
+tsIEG <- ts(IEG)
+plot(tsIEG[,3:4], main="Invoice Amount and Leads Line Charts")
+```
+The invoice amount serves as the response variable for this study.  The time realizations shows the strong "up and to the right" trend for invoice amounts over the life of the dataset.  The realization appears to show a slight wandering pattern around the mean.  The sample autocorrelation plot shows a slowly dampening pattern.  The periodogram and spectral density plots show a peak around zero with with some wandering around -5 dB.  The next highest point is near a frequency of 0.5.  There doesn't appear to be a strong seasonal trend in this dataset.
+```{r}
+psw <- plotts.sample.wge(IEG$Invoice_Amount, trunc = 50)
+```
+Closer examination of the output used to produce the spectral density chart shows a the maximum frequency is found at 0.0133.  This equates to a period of 75.  There are 75 observations in this dataset.  This is further proof of a lack of seasonality in the invoice amount data.  
+```{r}
+i <- which(psw$db==max(psw$db))
+max_freq <- psw$freq[i]
+period <- 1/psw$freq[i]
+cat("max_freq:", max_freq, " period:", period)
+```
+The expectation is there is a lag effect between leads and invoice amount.  The cross-correlation plot shows high points at -2 and 0.
+```{r}
+x <- ccf(IEG$Leads, IEG$Invoice_Amount)
+```
+
+The maximum ACF is found at observation 14, which is lag -2.  However, the similarly high point at 0 is notable as well.  For future investigation a "lagLeads" vector is created and attached to the IEG dataframe.  
+```{r}
+cat("Maximum ACF Lag:", which(x$acf==max(x$acf))) #lag -2
+lagLeads <- dplyr::lag(IEG$Leads,2)
+IEG$lagLeads <- lagLeads
+tsIEGlag <- ts(IEG)
+```
+
+A final test of the relationship between the leads, lagged leads, and invoice amount can be demonstrated by showing the Pearson R scores to illustrate the strength of the correlation.  Both Pearson's R score are similar.  However, the invoice amount and lagged leads produces a slightly higher result.
+```{r}
+cat("        Pearson's R - Invoice Amount and Leads:", cor(IEG$Invoice_Amount, IEG$Leads, method = "pearson"), "\n", 
+    "Pearson's R - Invoice Amount and lagged Leads:", cor(IEG$Invoice_Amount, IEG$lagLeads,use = "pairwise.complete.obs", 
+                                                          method = "pearson"))
+```
+
+
+## Time Series Modeling
+This section investigates univariate and multi-variate time series models to search for a suitable model for predicting revenue by invoice amount.  The horizon for these predictions will be 12 months.  The lag of 2 for leads and invoice amounts suggests management must look at least two months ahead to impact forecasting revenue, assuming opportunities (leads) are a primary driver of revenue.  While management's primary operating focus should be on a 2 to 6 month horizon, the 12 month horizon provides a valuable input for strategic decision making.  The Average Squared Error (ASE) will be a key tool to judge the quality of the inputs of the different predictions.  As this calculation will be repeated frequently, a simple ASE function is introduced below.
+
+```{r}
+func_calc_ASE <- function(actual, pred){
+  ASE_out <- mean((actual - pred)^2)
+  return(ASE_out)
+}
+```
+
+
+### Signal Plus Noise
+The univariate model used for this data is a signal plus noise model.  As shown above, there appears to be no significant seasonal trend in the data.  However, there appears to be a strong upward linear trend in the the revenue (invoice amount) realization with a possible white noise pattern around the linear trend.  This basic analysis suggests a linear signal plus noise model may be appropriate.
+
+The linear forecast generated by the signal plus noise model does not track the peaks and valleys of monthly revenue data (as expected).  Expectations with management may need to be set when presenting a simple linear trend line to forecast future values.  Data education is key to lay the ground work to present this as a viable option.  The signal plus noise model can be a powerful tool if the data supports its use.  
+```{r}
+fit.spn <- fore.sigplusnoise.wge(IEG$Invoice_Amount, linear = TRUE, max.p = 5, n.ahead = 12, lastn = TRUE, plot = TRUE)
+```
+The linear forecast hits several of the actual values almost exactly.  The ASE for the signal plus noise model is calculated and displayed below.
+```{r}
+ase <- func_calc_ASE(IEG$Invoice_Amount[(length(IEG$Invoice_Amount)-11):length(IEG$Invoice_Amount)], fit.spn$f)
+cat("Signal Plus Noise ASE:", ase)
+```
+
+Additional insight can be gained from the data returned by the signal plus noise model.  The slope suggests management should expect revenue to increase by of $6516.99 per month (on average).  This information can be used to plan for future headcount, infrastructure, and line of business expansion.  More importantly, it is critical to monitory the slope of the forecast over time as well.  Since this data tend to return to the mean over time, the changes in forecast slope are likely more important data points than monthly swings in revenue.  
+```{r}
+fit.spn$b0
+```
+
+To assure the residuals from the fit.spn object resmeble a white noise process, plots and the Ljung-Box test will be used.  The residual scatter plot appears to be fairly white.
+```{r}
+plot(fit.spn$resid[1:length(IEG$Invoice_Amount)], main="Signal Plus Noise Residuals", ylab="Invoice Amount Residuals")
+```
+The autocorrelation plot shows only one lag barely exeeding the upper limit.
+```{r}
+acf(fit.spn$resid[1:length(IEG$Invoice_Amount)])
+```
+The Ljung-Box test is used to verigy the residuals from the MLP time series model resembles white noise.  Test with K=24 and K=48 are run.  Both fail to reject the null hypothesis with P Values greater than a level of significance of 0.05.  Based on the dot plot, ACF plot, and Ljung-Box test results, the residuals from the MLP model appear to be white noise.
+```{r}
+y <- ljung.wge(fit.spn$resid[1:length(IEG$Invoice_Amount)], K=24)
+z <- ljung.wge(fit.spn$resid[1:length(IEG$Invoice_Amount)], K=48)
+cat("\n", "P-Value at K=24:", y$pval, "\n", "P-Value at K=48:", z$pval)
+```
+
+### VAR
+The Vector Auto-Regressive (VAR) model is the allows for multivariate time series modeling.  Training and testing dataframes are created to guage the quality of the revenue forecasts produced by the VAR model.  VAR models were tested with and without lagged leads.  Both models performed well, but the VAR model without lagged leads produced a lower ASE.  The VAR modeling begins by using the VARselect function to automatically identify the optimum "p" value.  p=1 is selected by all of the "$selection" modes in VARselect.  The VAR model is then fit and a forecast is generated.
+
+```{r}
+VARselect(tsIEGlag[1:(nrow(tsIEGlag)-12),c(3,4)], lag.max = 10, type = "both", season=12)
+fit.var2 <- VAR(tsIEGlag[1:(nrow(tsIEGlag)-12),c(3,4)], p=1, type = "both")
+fore.var2 <- predict(fit.var2, n.ahead = 12)
+```
+The VAR model essentially generates a linear model which is not surprising with a p=1.  
+```{r}
+plot(tsIEGlag[,3], main="VAR Predictions: Actual to Estimated", ylab="Invoice Amount", type='l')
+lines(seq(64,75,1), fore.var2$fcst$Invoice_Amount[,1], type='p', col = 'blue')
+```
+The ASE produced by this model is higher than the Signal Plus Noise model.  
+```{r}
+ase <- func_calc_ASE(tsIEGlag[(nrow(tsIEGlag)-11):nrow(tsIEGlag), 3], fore.var2$fcst$Invoice_Amount[,1])
+cat("VAR 2 ASE:", ase)
+```
+The residuals from the fit.var2 object are examined to assure they resemble white noise.  The dot plot appears to be reasonably white.  
+```{r}
+plot(residuals(fit.var2)[,1], main="VAR Residuals", ylab="Invoice Amount Residuals")
+```
+The ACF plot only have one lag at 10 which exceeds the limit.  This could be cause for concern since the value at lag 10 exceeds the limit line by quite a bit.  
+```{r}
+acf(residuals(fit.var2)[,1])
+```
+
+The Ljung-Box test is used to verigy the residuals from the MLP time series model resembles white noise.  Test with K=24 and K=48 are run.  Both fail to reject the null hypothesis with P Values greater than a level of significance of 0.05.  However, the p-value at K=24 could lead to rejecting the null hypothesis if the level of significance is set at 0.1.  Based on the dot plot, ACF plot, and Ljung-Box test results, the residuals from the MLP model appear to be white noise.
+```{r}
+y <- ljung.wge(residuals(fit.var2)[,1], K=24)
+z <- ljung.wge(residuals(fit.var2)[,1], K=48)
+cat("\n", "P-Value at K=24:", y$pval, "\n", "P-Value at K=48:", z$pval)
+```
+
+### Neural Network
+Several types of neural networks exists.  In this section, a multi-layer perception (MLP) neural network will be trained and tested to evaluate its predictive abilities.  To begin, the IEG dataframe is split into train and test dataframes based on a 12 month horizon.  A dataframe with extra regressors for leads and time components are created as well.  The presence of extra-regressors makes this a multi-variate model.
+```{r}
+## Model 4 - 3 extra regressors
+iegTrain <- ts(IEG$Invoice_Amount[1:(nrow(IEG)-12)])
+iegTest <- ts(IEG$Invoice_Amount[(nrow(IEG)-11):nrow(IEG)])
+iegX3 <- data.frame(Year = ts(IEG$Year), ts(IEG$Month_Nbr), ts(IEG$Leads))
+```
+The MLP neural network is fit using the training dataframe.  Thrity networks are trained and used to produce an ensemble forecast.  The "hd.auto.type = 'cv'" is chosen to allow the mlp function to choose the optimal number of nodes and hidden layers for the MLP using five fold cross validation.  The dataframe of extra-regressors is input as well.  Many variations of an MLP were tested prior to selecting this particular model.  The resulting fit plot shows a fairly linear network.  There are 8 total inputs (invoice amount, leads, two time components, and four lagged inputs) and one hidden layer in the ensemble nework.   
+```{r}
+#fit model and calc ASE
+set.seed(8)
+fit.mlp <- mlp(iegTrain, hd.auto.type = 'cv', reps = 30, xreg = iegX3)
+plot(fit.mlp)
+```
+
+A forecast is generated using the 'fit.mlp' object created above.  The forecast shows a fairly compact distribution of the 30 individual networks (grey lines) with the ensemble forecast (blue line) shows the actual forecasted values.  
+```{r}
+fore.mlp <- forecast(fit.mlp, h=12, xreg = iegX3, level = 95)
+plot(fore.mlp)
+```
+This forecast can be compared to the actual last 12 actual invoice amount observations.  The plot focuses an the comparison of the actual (black line) to estimated (blue line) values.  Visual examination suggests the model is generally in the neighborhood of the actual values, but it does not seem to match the overall peaks and values of the actual values.  The calculated ASE is displayed as well.  
+```{r}
+plot(IEG$Invoice_Amount[(nrow(IEG)-11):nrow(IEG)],type = "l", main='Acutal to Estimated Comparison', ylab="Invoice Amount")
+lines(seq(1,12),fore.mlp$mean[1:12], col = "blue", type = 'l')
+ase <- func_calc_ASE((iegTest[1:length(iegTest)]), fore.mlp$mean[1:length(fore.mlp$mean)])
+cat("MLP ASE:", ase)
+```
+The plotted residuals from the MLP model appear to resemble white noise.  
+```{r}
+#check residuals
+plot(fore.mlp$residuals, type='p', main="MLP Residuals", ylab="Invoice Amount Residuals")
+```
+The autocorrelations stay within the limits through lag 17.
+```{r}
+acf(fore.mlp$residuals)
+```
+The Ljung-Box test is used to verigy the residuals from the MLP time series model resembles white noise.  Test with K=24 and K=48 are run.  Both fail to reject the null hypothesis with P Values greater than a level of significance of 0.05.  Based on the dot plot, ACF plot, and Ljung-Box test results, the residuals from the MLP model appear to be white noise.
+```{r}
+y <- ljung.wge(fore.mlp$residuals, K=24)
+z <- ljung.wge(fore.mlp$residuals, K=48)
+cat("\n", "P-Value at K=24:", y$pval, "\n", "P-Value at K=48:", z$pval)
+```
+
+### Ensemble Model
+Several combinations of the Signal Plus Noise, VAR, and MLP models were created to identify a suitable ensemble model.  The various differnt ensemble formulas with their ASE scores are shown below.  None of the models produce an ASE score superior to the Signal Plus Noise model.  The story told by the different ensemble models is the closer the results mirror the Signal Plus Noise model, the better the result.  For completeness, the ensemble model chosen for this study is conceptually borrowed from the PERT estimating formula.  The PERT estimating formula is a weighted average technique typically used in project estimation.  Optimistic, pessimistic, and most likely time estimates are gathered and fed into the formula shown below:
+
+$\frac{pessimtic + (4*most likely) + optimistic}{6}$
+
+In this case, the the signal plus noise model will be used as the "most likely".  The VAR and MLP models will fill the role of pessimistic and optimistic with no weighted coefficients.  This ensemble model preserves the largely linear output of the VAR and Signal Plus Noise models while allowing some monthly variation from the MLP model.  The long term hope is this strategy will provide more accurate forecasts.
+
+```{r}
+fore.ensemblePert <- ((fit.spn$f*4) + fore.mlp$mean + fore.var2$fcst$Invoice_Amount[,1])/6 #Ensemble ASE: 8214875775
+
+#fore.ensemble <- (fit.spn$f + fore.mlp$mean)/2 #Ensemble ASE: 9131942791
+#fore.ensemble3 <- (fit.spn$f + fore.mlp$mean + fore.var2$fcst$Invoice_Amount[,1])/3 #Ensemble ASE: 8614463855
+#fore.ensemble4 <- ((fit.spn$f*3) + fore.mlp$mean)/4 #Ensemble ASE: 8377379721
+#fore.ensemble5 <- ((fit.spn$f*5) + fore.mlp$mean)/6 #Ensemble ASE: 8197909347
+#fore.ensemble6 <- (fit.spn$f + fore.var2$fcst$Invoice_Amount[,1])/2 #Ensemble ASE: 8072032062
+```
+While the desired effect of allowing some variability from the MLP model into the mostly linear results of the Signal Plus Noise and VAR models is achieved.  However, the variability introduced by the MLP model produces monthly forecasts which run counter to the actual in several instances.  
+```{r}
+plot(tsIEGlag[,3], main="Ensemble Model Predictions: Actual to Estimated", ylab="Invoice Amount", type='l')
+lines(seq(64,75,1), fore.ensemblePert, type='p', col = 'blue')
+```
+The ASE produced by the "PERT" ensemble model.  This is a respectable score which could warrant fouther examination of this weighted average model in the future.  
+```{r}
+ase <- func_calc_ASE((iegTest[1:length(iegTest)]), fore.ensemble7[1:length(fore.ensemble3)])
+cat("Ensemble ASE:", ase)
+```
+
+## Model Selection
+The results from all three models have indicated a linear forecast is best suited for this time series problem.  The Signal Plus Noise model clearly produced the superior results judging from the ASE.  If a single was model is to be chosen to forecasts revenue for this data, the Signal Plus Noise model would be selected.  The "PERT" Ensemble and MLP models could be used in conjunction with the Signal Plus Noise model to provide valuable insights on potential monthly swings in revenue if properly tuned.  The ASE results from all four models are shown below.
+
+| Model             	| ASE            	|
+|-------------------	|----------------	|
+| Signal Plus Noise 	| 7,947,044,573  	|
+| VAR               	| 8,308,162,703  	|
+| MLP               	| 11,613,752,691 	|
+| Ensemble          	| 8,244,191,442  	|
+
+## Forecasting
+The Signal Plus Noise forecast for the next 12 months is shown below.  
+```{r}
+t <- fore.sigplusnoise.wge(IEG$Invoice_Amount, linear = TRUE, max.p = 5, n.ahead = 12, lastn = FALSE, plot = TRUE)
+```
+
+## Conclusion
+The signal plus noise model produces easily digestable results.  The univariate forecast also provides the advantage of not having to estimate the values of extra regressors into the future.  However, the benefit of learning how additional variables impact revenue is not applicable to univariate forecasts.  While the signal plus noise forecast can seem simpilistic to the eye, the value of this forecast is the knowledge that revenue oscilates around a increasing linear mean.  So, chasing month to month revenue fluctuations may not be as valuable as montoring the overall slope of the forecast line.  Additionally, the other three models evaluated in this study should not be discarded.  When used in conjunction with the Signal Plus Noise forecast, decision makers may have additional data points available to fine tune forward looking plans.  The ensemble model may be of particular value in detecting monthly variation while combining the established linear trend.  This is only a starting point for investigating revenue forecasting.  Additional variables such as advanced sales pipeline statistics, headcount, lead type, and department
+
